@@ -41,6 +41,7 @@ KARTE_TIKTOK_ID_PROP = "クリエイターID"
 
 # Property names on イベント DB used to match by name
 EVENT_TITLE_PROP = "イベント名"
+EVENT_BACKSTAGE_ID_PROP = "BackstageイベントID"
 
 # Property names on イベント実績 DB
 RES_TITLE = "タイトル"
@@ -170,14 +171,18 @@ def _period_overlap_ratio(bs_start: str, bs_end: str, ev_start: Optional[str], e
     return overlap_days / min(bs_days, ev_days)
 
 
-def match_event(backstage_key: str, bs_start: Optional[str], bs_end: Optional[str], events: List[dict]) -> Optional[str]:
-    """Match Backstage event to イベント DB entry. Period overlap is primary signal, name is tiebreaker.
-    Rules:
-      - Compute period overlap for every DB entry (needs both sides' start/end set)
-      - Accept an entry only if overlap ratio ≥ 0.6 (at least 60% of the shorter range overlaps)
-      - If multiple pass threshold, pick best by (overlap_ratio, name_substring_ratio)
-      - No name-only fallback (too noisy, e.g. "Music stars" vs "Music Rising")
+def match_event(backstage_key: str, bs_start: Optional[str], bs_end: Optional[str], events: List[dict], backstage_event_id: Optional[str] = None) -> Optional[str]:
+    """Match Backstage event to イベント DB entry.
+    Priority:
+      1. Exact match on BackstageイベントID (if user set it on the DB entry)
+      2. Period overlap ≥ 60% + name tiebreaker
+    No name-only fallback — too noisy (e.g. Music stars ≠ Music Rising).
     """
+    # 1. Exact ID match (most reliable — user-set mapping)
+    if backstage_event_id:
+        for ev in events:
+            if ev.get("backstageId") == backstage_event_id:
+                return ev["pageId"]
     if not bs_start or not bs_end or not events:
         return None
     candidates = []
@@ -234,12 +239,15 @@ def load_event_index() -> List[dict]:
             props = p.get("properties", {})
             title_prop = props.get(EVENT_TITLE_PROP, {})
             name = "".join(t.get("plain_text", "") for t in title_prop.get("title", []) or [])
+            bs_prop = props.get(EVENT_BACKSTAGE_ID_PROP, {})
+            bs_id = "".join(t.get("plain_text", "") for t in bs_prop.get("rich_text", []) or []).strip()
             events.append({
                 "pageId": p["id"],
                 "name": name,
                 "key": normalize_event_name(name),
                 "start": _date("開始日", props),
                 "end": _date("終了日", props),
+                "backstageId": bs_id,
             })
         pages += 1
         if not resp.get("has_more") or pages > 10:
@@ -349,7 +357,7 @@ def sync_summaries(summaries: List[dict]) -> dict:
         event_key = normalize_event_name(s.get("eventName", ""))
         bs_start = datetime.fromtimestamp(int(s["eventStart"]), JST).strftime("%Y-%m-%d") if s.get("eventStart") else None
         bs_end = datetime.fromtimestamp(int(s["eventEnd"]), JST).strftime("%Y-%m-%d") if s.get("eventEnd") else None
-        event_page_id = match_event(event_key, bs_start, bs_end, event_idx)
+        event_page_id = match_event(event_key, bs_start, bs_end, event_idx, backstage_event_id=s.get("eventId"))
         if event_page_id:
             stats["events_linked"] += 1
             print(f"\n[notion] event '{s.get('eventName', '')}' phase={phase}  → linked to イベントDB")
