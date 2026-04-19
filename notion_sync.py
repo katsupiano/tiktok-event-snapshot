@@ -31,8 +31,8 @@ JST = timezone(timedelta(hours=9))
 NOTION_API = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 
-KARTE_DB_ID = os.environ.get("NOTION_KARTE_DB_ID", "e65495b5dfc64a38a90018e40aaeeeab")
-RESULTS_DB_ID = os.environ.get("NOTION_RESULTS_DB_ID", "94bf21fce78f4fc093a128313a6c8da3")
+KARTE_DB_ID = os.environ.get("NOTION_KARTE_DB_ID") or "e65495b5dfc64a38a90018e40aaeeeab"
+RESULTS_DB_ID = os.environ.get("NOTION_RESULTS_DB_ID") or "94bf21fce78f4fc093a128313a6c8da3"
 
 # Property names on カルテ DB used to match creator
 KARTE_TITLE_PROP = "クリエイター名"
