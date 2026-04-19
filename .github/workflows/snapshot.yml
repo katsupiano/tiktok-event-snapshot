@@ -32,17 +32,23 @@ jobs:
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
-      - name: Restore session state from secrets
+      - name: Restore session state from chunked secrets
         env:
-          STORAGE_BCODE_B64: ${{ secrets.STORAGE_BCODE_B64 }}
-          STORAGE_ULYSSES_B64: ${{ secrets.STORAGE_ULYSSES_B64 }}
+          BCODE_P1: ${{ secrets.STORAGE_BCODE_PART1 }}
+          BCODE_P2: ${{ secrets.STORAGE_BCODE_PART2 }}
+          BCODE_P3: ${{ secrets.STORAGE_BCODE_PART3 }}
+          ULYSSES_P1: ${{ secrets.STORAGE_ULYSSES_PART1 }}
+          ULYSSES_P2: ${{ secrets.STORAGE_ULYSSES_PART2 }}
+          ULYSSES_P3: ${{ secrets.STORAGE_ULYSSES_PART3 }}
         run: |
           mkdir -p sessions
-          printf '%s' "$STORAGE_BCODE_B64" | base64 -d > sessions/storage_state.json
-          if [ -n "$STORAGE_ULYSSES_B64" ]; then
-            printf '%s' "$STORAGE_ULYSSES_B64" | base64 -d > sessions/storage_state_ulysses.json
+          # Chunks were produced via: base64(gzip(storage_state.json)) then split
+          printf '%s%s%s' "$BCODE_P1" "$BCODE_P2" "$BCODE_P3" | base64 -d | gunzip > sessions/storage_state.json
+          if [ -n "$ULYSSES_P1" ]; then
+            printf '%s%s%s' "$ULYSSES_P1" "$ULYSSES_P2" "$ULYSSES_P3" | base64 -d | gunzip > sessions/storage_state_ulysses.json
           fi
           wc -c sessions/*.json
+          python -c "import json; print('bcode cookies:', len(json.load(open('sessions/storage_state.json'))['cookies']))"
 
       - name: Run event snapshot
         env:
