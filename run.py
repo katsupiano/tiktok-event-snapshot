@@ -29,6 +29,60 @@ sys.path.insert(0, str(BASE))
 from scrape_event import scrape_event_with_session, merge_agency_results, build_summary
 from discover_events import discover
 
+import urllib.request
+import urllib.error
+
+
+def post_slack_summary(summaries: list, notion_stats, ts: str) -> None:
+    """Send a summary message to Slack via incoming webhook. Silently no-op if not configured."""
+    url = os.environ.get("SLACK_WEBHOOK_URL")
+    if not url:
+        return
+    try:
+        total_events = len(summaries)
+        total_katsu = sum(s.get("katsuCount", 0) for s in summaries)
+        total_all = sum(s.get("totalParticipants", 0) for s in summaries)
+        run_url_base = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+        run_repo = os.environ.get("GITHUB_REPOSITORY", "")
+        run_id = os.environ.get("GITHUB_RUN_ID", "")
+        run_url = f"{run_url_base}/{run_repo}/actions/runs/{run_id}" if run_repo and run_id else "(local run)"
+
+        lines = [
+            f"✅ *イベントスナップショット完了* `{ts}`",
+            f"📊 進行中 *{total_events}* イベント / 合計 {total_all:,}名 / *KATSU {total_katsu}名*",
+        ]
+        if notion_stats:
+            lines.append(
+                f"📝 Notion: 新規 {notion_stats.get('created', 0)} / 更新 {notion_stats.get('updated', 0)} / 失敗 {notion_stats.get('failed', 0)}"
+            )
+            unlinked = notion_stats.get("unlinked_names", []) or []
+            if unlinked:
+                shown = ", ".join(unlinked[:5])
+                more = f" …他{len(unlinked)-5}件" if len(unlinked) > 5 else ""
+                lines.append(f"⚠️ 未紐付け {len(unlinked)}件: {shown}{more}")
+        lines.append(f"🔗 {run_url}")
+
+        per_event = "\n".join(
+            f"  • {s.get('eventName','')[:50]} — KATSU {s.get('katsuCount', 0)}名"
+            for s in summaries[:8]
+        )
+        if per_event:
+            lines.append(per_event)
+        if len(summaries) > 8:
+            lines.append(f"  …他 {len(summaries)-8} イベント")
+
+        payload = {"text": "\n".join(lines)}
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            print(f"[slack] notified ({r.status})")
+    except Exception as e:
+        print(f"[slack] notify err: {e}")
+
 REALTIME = BASE.parent / "realtime_scraper"
 EVENTS_DIR = BASE / "events"
 JST = timezone(timedelta(hours=9))
@@ -110,18 +164,22 @@ def main():
         all_summaries.append(summary)
 
     # 3. Notion sync
+    notion_stats = None
     if not args.skip_notion and os.environ.get("NOTION_TOKEN"):
         try:
             from notion_sync import sync_summaries
             relevant = [s for s in all_summaries if not args.only_with_katsu or s["katsuCount"] > 0]
             print(f"\n[notion] syncing {len(relevant)} event summaries…")
-            sync_summaries(relevant)
+            notion_stats = sync_summaries(relevant)
         except Exception as e:
             print(f"[notion] err: {e}")
             traceback.print_exc()
     else:
         reason = "--skip-notion" if args.skip_notion else "no NOTION_TOKEN"
         print(f"\n[notion] skipped ({reason})")
+
+    # Slack notification (if webhook configured)
+    post_slack_summary(all_summaries, notion_stats, ts)
 
     # 4. Global snapshot index
     idx_path = EVENTS_DIR / "snapshots_index.json"

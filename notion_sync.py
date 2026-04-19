@@ -335,7 +335,7 @@ def sync_summaries(summaries: List[dict]) -> dict:
     """Push each summary's katsuParticipants into イベント実績 DB.
     Returns stats dict.
     """
-    stats = {"created": 0, "updated": 0, "failed": 0, "skipped_no_karte": 0, "events_linked": 0, "events_unlinked": 0}
+    stats = {"created": 0, "updated": 0, "failed": 0, "skipped_no_karte": 0, "events_linked": 0, "events_unlinked": 0, "unlinked_names": []}
 
     print("[notion] loading karte index…")
     karte_idx = load_karte_index()
@@ -363,6 +363,7 @@ def sync_summaries(summaries: List[dict]) -> dict:
             print(f"\n[notion] event '{s.get('eventName', '')}' phase={phase}  → linked to イベントDB")
         else:
             stats["events_unlinked"] += 1
+            stats["unlinked_names"].append(s.get("eventName", "(no name)"))
             print(f"\n[notion] event '{s.get('eventName', '')}' phase={phase}  → UNLINKED (no match in イベントDB, normalized key='{event_key}')")
         participants = s.get("katsuParticipants", [])
         print(f"[notion] participants={len(participants)}")

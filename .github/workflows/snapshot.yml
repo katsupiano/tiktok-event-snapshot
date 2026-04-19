@@ -58,12 +58,24 @@ jobs:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_KARTE_DB_ID: ${{ secrets.NOTION_KARTE_DB_ID }}
           NOTION_RESULTS_DB_ID: ${{ secrets.NOTION_RESULTS_DB_ID }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         run: |
           EVENT_IDS="${{ github.event.inputs.event_ids }}"
           if [ -n "$EVENT_IDS" ]; then
             python run.py --event-ids="$EVENT_IDS"
           else
             python run.py
+          fi
+
+      - name: Slack notify on failure
+        if: failure()
+        env:
+          WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -n "$WEBHOOK" ]; then
+            curl -s -X POST -H "Content-Type: application/json" \
+              -d "{\"text\":\"🚨 *イベントスナップショット失敗*\\nRun: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}\\nセッション切れの可能性あり。ログ確認 → storage_state 更新要\"}" \
+              "$WEBHOOK" || true
           fi
 
       - name: Back up refreshed sessions to artifact
