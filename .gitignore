@@ -1,0 +1,19 @@
+# Dev artifacts
+probe*.py
+probe_*.json
+*.png
+
+# Session files (stored as GitHub Secrets, restored at runtime)
+sessions/
+storage_state*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS
+.DS_Store
+events/

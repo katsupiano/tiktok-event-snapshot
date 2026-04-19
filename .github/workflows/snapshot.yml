@@ -1,0 +1,84 @@
+name: event-snapshot
+
+on:
+  # JST 12:00 = UTC 03:00, JST 24:00 (翌 00:00) = UTC 15:00
+  schedule:
+    - cron: '0 3 * * *'
+    - cron: '0 15 * * *'
+  workflow_dispatch:
+    inputs:
+      event_ids:
+        description: "Comma-separated event IDs (empty = auto-discover)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install deps
+        run: |
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Restore session state from secrets
+        env:
+          STORAGE_BCODE_B64: ${{ secrets.STORAGE_BCODE_B64 }}
+          STORAGE_ULYSSES_B64: ${{ secrets.STORAGE_ULYSSES_B64 }}
+        run: |
+          mkdir -p sessions
+          printf '%s' "$STORAGE_BCODE_B64" | base64 -d > sessions/storage_state.json
+          if [ -n "$STORAGE_ULYSSES_B64" ]; then
+            printf '%s' "$STORAGE_ULYSSES_B64" | base64 -d > sessions/storage_state_ulysses.json
+          fi
+          wc -c sessions/*.json
+
+      - name: Run event snapshot
+        env:
+          HEADLESS: "1"
+          STORAGE_BCODE: ${{ github.workspace }}/sessions/storage_state.json
+          STORAGE_ULYSSES: ${{ github.workspace }}/sessions/storage_state_ulysses.json
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_KARTE_DB_ID: ${{ secrets.NOTION_KARTE_DB_ID }}
+          NOTION_RESULTS_DB_ID: ${{ secrets.NOTION_RESULTS_DB_ID }}
+        run: |
+          EVENT_IDS="${{ github.event.inputs.event_ids }}"
+          if [ -n "$EVENT_IDS" ]; then
+            python run.py --event-ids="$EVENT_IDS"
+          else
+            python run.py
+          fi
+
+      - name: Back up refreshed sessions to artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sessions-refreshed-${{ github.run_id }}
+          path: sessions/*.json
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Commit snapshot outputs
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Only commit events/ — never sessions/
+          git add events/ 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "no changes to commit"
+          else
+            git commit -m "snapshot: $(date -u +%Y-%m-%dT%H:%MZ)"
+            git push
+          fi
