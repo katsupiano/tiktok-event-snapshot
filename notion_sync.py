@@ -33,10 +33,14 @@ NOTION_VERSION = "2022-06-28"
 
 KARTE_DB_ID = os.environ.get("NOTION_KARTE_DB_ID") or "e65495b5dfc64a38a90018e40aaeeeab"
 RESULTS_DB_ID = os.environ.get("NOTION_RESULTS_DB_ID") or "94bf21fce78f4fc093a128313a6c8da3"
+EVENTS_DB_ID = os.environ.get("NOTION_EVENTS_DB_ID") or "e0ff7ce241954338be8334b9063d1356"
 
 # Property names on カルテ DB used to match creator
 KARTE_TITLE_PROP = "クリエイター名"
 KARTE_TIKTOK_ID_PROP = "クリエイターID"
+
+# Property names on イベント DB used to match by name
+EVENT_TITLE_PROP = "イベント名"
 
 # Property names on イベント実績 DB
 RES_TITLE = "タイトル"
@@ -54,6 +58,7 @@ RES_CAPTURED_AT = "取得時刻"
 RES_AGENCY = "エージェンシー"
 RES_START = "開始日"
 RES_END = "終了日"
+RES_EVENT_REL = "イベント"  # Relation → イベント DB
 
 
 def _token() -> str:
@@ -123,6 +128,79 @@ def load_karte_index() -> Dict[str, str]:
     return idx
 
 
+def normalize_event_name(name: str) -> str:
+    """Lowercase, strip whitespace, remove emoji/symbol blocks, normalize digits. For fuzzy-match keying."""
+    import re
+    s = (name or "").strip().lower()
+    # Remove emoji/pictograph ranges and variation selectors
+    s = re.sub(r"[\U0001F300-\U0001FAFF\U0001F600-\U0001F64F\U0001F680-\U0001F6FF\U0001F700-\U0001F77F\U0001F780-\U0001F7FF\U0001F800-\U0001F8FF\U0001F900-\U0001F9FF\U0001FA00-\U0001FA6F\U00002600-\U000027BF\uFE00-\uFE0F\u200D]", "", s)
+    # Kanji digits → ASCII (一二三四五六七八九十)
+    kanji_digits = {"一": "1", "二": "2", "三": "3", "四": "4", "五": "5",
+                    "六": "6", "七": "7", "八": "8", "九": "9", "十": "10"}
+    for k, v in kanji_digits.items():
+        s = s.replace(k, v)
+    # Remove punctuation/question marks/exclamation (full+half width) + year markers
+    s = re.sub(r"[\s!?！？・\-—‐\u3000、。.,]", "", s)
+    s = re.sub(r"20\d{2}年?", "", s)  # strip year prefix like "2026年"
+    s = s.replace("第", "").replace("回", "")
+    # Strip all remaining ASCII digits (position-sensitive e.g. "第3回" vs "第三回")
+    s = re.sub(r"[0-9]+", "", s)
+    return s
+
+
+def match_event(backstage_key: str, event_idx: Dict[str, str]) -> Optional[str]:
+    """Try exact then substring both-ways. Returns event page_id or None.
+    Substring match requires the shorter side to be ≥5 chars AND ≥40% of the longer,
+    to avoid spurious matches on generic words.
+    """
+    if not backstage_key:
+        return None
+    if backstage_key in event_idx:
+        return event_idx[backstage_key]
+    # Substring match
+    best_id = None
+    best_score = 0.0
+    for k, pid in event_idx.items():
+        if not k or len(k) < 3:
+            continue
+        if k in backstage_key or backstage_key in k:
+            short, long = (k, backstage_key) if len(k) < len(backstage_key) else (backstage_key, k)
+            ratio = len(short) / max(len(long), 1)
+            if ratio >= 0.3 and ratio > best_score:
+                best_score = ratio
+                best_id = pid
+    return best_id
+
+
+def load_event_index() -> Dict[str, str]:
+    """Return {normalized_name: event_page_id} map from イベント DB."""
+    idx: Dict[str, str] = {}
+    cursor = None
+    pages = 0
+    while True:
+        body = {"page_size": 100}
+        if cursor:
+            body["start_cursor"] = cursor
+        try:
+            resp = _request("POST", f"/databases/{EVENTS_DB_ID}/query", body)
+        except Exception as e:
+            print(f"[notion] load_event_index err: {e}")
+            return idx
+        for p in resp.get("results", []):
+            props = p.get("properties", {})
+            title_prop = props.get(EVENT_TITLE_PROP, {})
+            name = "".join(t.get("plain_text", "") for t in title_prop.get("title", []) or [])
+            key = normalize_event_name(name)
+            if key:
+                # If collision, keep first; user will see duplicates in DB
+                idx.setdefault(key, p["id"])
+        pages += 1
+        if not resp.get("has_more") or pages > 10:
+            break
+        cursor = resp.get("next_cursor")
+    return idx
+
+
 def find_existing_row(event_id: str, host_id: str, date_iso: str) -> Optional[str]:
     """Look up an existing row for (event_id, host_id, date) — returns page_id or None."""
     # Match by event ID + title containing host_id fragment + date
@@ -160,7 +238,7 @@ def compute_phase(event_start: Optional[int], event_end: Optional[int], now_ts: 
     return "中間"
 
 
-def build_properties(summary: dict, entry: dict, karte_id: Optional[str], date_iso: str, phase: str) -> dict:
+def build_properties(summary: dict, entry: dict, karte_id: Optional[str], date_iso: str, phase: str, event_page_id: Optional[str] = None) -> dict:
     """Construct Notion properties payload for one row."""
     nickname = entry.get("nickname", "")
     host_id = entry.get("hostId", "")
@@ -186,6 +264,8 @@ def build_properties(summary: dict, entry: dict, karte_id: Optional[str], date_i
         props[RES_TIER] = {"select": {"name": tier_opt}}
     if karte_id:
         props[RES_CREATOR] = {"relation": [{"id": karte_id}]}
+    if event_page_id:
+        props[RES_EVENT_REL] = {"relation": [{"id": event_page_id}]}
     # Event dates
     es = summary.get("eventStart")
     ee = summary.get("eventEnd")
@@ -200,11 +280,15 @@ def sync_summaries(summaries: List[dict]) -> dict:
     """Push each summary's katsuParticipants into イベント実績 DB.
     Returns stats dict.
     """
-    stats = {"created": 0, "updated": 0, "failed": 0, "skipped_no_karte": 0}
+    stats = {"created": 0, "updated": 0, "failed": 0, "skipped_no_karte": 0, "events_linked": 0, "events_unlinked": 0}
 
     print("[notion] loading karte index…")
     karte_idx = load_karte_index()
     print(f"[notion] karte: {len(karte_idx)} creators indexed")
+
+    print("[notion] loading event index…")
+    event_idx = load_event_index()
+    print(f"[notion] events: {len(event_idx)} entries indexed")
 
     now_ts = int(datetime.now(JST).timestamp())
     date_iso = datetime.now(JST).strftime("%Y-%m-%d")
@@ -215,8 +299,16 @@ def sync_summaries(summaries: List[dict]) -> dict:
             int(s.get("eventEnd") or 0),
             now_ts,
         )
+        event_key = normalize_event_name(s.get("eventName", ""))
+        event_page_id = match_event(event_key, event_idx)
+        if event_page_id:
+            stats["events_linked"] += 1
+            print(f"\n[notion] event '{s.get('eventName', '')}' phase={phase}  → linked to イベントDB")
+        else:
+            stats["events_unlinked"] += 1
+            print(f"\n[notion] event '{s.get('eventName', '')}' phase={phase}  → UNLINKED (no match in イベントDB, normalized key='{event_key}')")
         participants = s.get("katsuParticipants", [])
-        print(f"\n[notion] event '{s.get('eventName', '')}' phase={phase}  participants={len(participants)}")
+        print(f"[notion] participants={len(participants)}")
         for e in participants:
             username = (e.get("username") or "").strip().lower()
             host_id = e.get("hostId", "")
@@ -224,7 +316,7 @@ def sync_summaries(summaries: List[dict]) -> dict:
             if not karte_id:
                 stats["skipped_no_karte"] += 1
                 # Still proceed without relation (leave creator blank)
-            props = build_properties(s, e, karte_id, date_iso, phase)
+            props = build_properties(s, e, karte_id, date_iso, phase, event_page_id)
 
             try:
                 existing = find_existing_row(s["eventId"], host_id, date_iso)
