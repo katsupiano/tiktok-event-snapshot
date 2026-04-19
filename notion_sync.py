@@ -148,33 +148,77 @@ def normalize_event_name(name: str) -> str:
     return s
 
 
-def match_event(backstage_key: str, event_idx: Dict[str, str]) -> Optional[str]:
-    """Try exact then substring both-ways. Returns event page_id or None.
-    Substring match requires the shorter side to be ≥5 chars AND ≥40% of the longer,
-    to avoid spurious matches on generic words.
+def _period_overlap_ratio(bs_start: str, bs_end: str, ev_start: Optional[str], ev_end: Optional[str]) -> float:
+    """Return overlap ratio ∈ [0,1] between two YYYY-MM-DD ranges. 0 if either range missing."""
+    if not (bs_start and bs_end and ev_start and ev_end):
+        return 0.0
+    try:
+        from datetime import date
+        def d(s: str) -> date:
+            return date.fromisoformat(s)
+        bs_s, bs_e = d(bs_start), d(bs_end)
+        ev_s, ev_e = d(ev_start), d(ev_end)
+    except Exception:
+        return 0.0
+    overlap_start = max(bs_s, ev_s)
+    overlap_end = min(bs_e, ev_e)
+    if overlap_start > overlap_end:
+        return 0.0
+    overlap_days = (overlap_end - overlap_start).days + 1
+    bs_days = (bs_e - bs_s).days + 1
+    ev_days = (ev_e - ev_s).days + 1
+    return overlap_days / min(bs_days, ev_days)
+
+
+def match_event(backstage_key: str, bs_start: Optional[str], bs_end: Optional[str], events: List[dict]) -> Optional[str]:
+    """Match Backstage event to イベント DB entry. Period overlap is primary signal, name is tiebreaker.
+    Rules:
+      - Compute period overlap for every DB entry (needs both sides' start/end set)
+      - Accept an entry only if overlap ratio ≥ 0.6 (at least 60% of the shorter range overlaps)
+      - If multiple pass threshold, pick best by (overlap_ratio, name_substring_ratio)
+      - No name-only fallback (too noisy, e.g. "Music stars" vs "Music Rising")
     """
-    if not backstage_key:
+    if not bs_start or not bs_end or not events:
         return None
-    if backstage_key in event_idx:
-        return event_idx[backstage_key]
-    # Substring match
-    best_id = None
-    best_score = 0.0
-    for k, pid in event_idx.items():
-        if not k or len(k) < 3:
-            continue
-        if k in backstage_key or backstage_key in k:
-            short, long = (k, backstage_key) if len(k) < len(backstage_key) else (backstage_key, k)
-            ratio = len(short) / max(len(long), 1)
-            if ratio >= 0.3 and ratio > best_score:
-                best_score = ratio
-                best_id = pid
-    return best_id
+    candidates = []
+    for ev in events:
+        ratio = _period_overlap_ratio(bs_start, bs_end, ev.get("start"), ev.get("end"))
+        if ratio >= 0.6:
+            # Name substring contribution
+            nk = ev.get("key") or ""
+            name_score = 0.0
+            if nk and backstage_key:
+                if nk in backstage_key or backstage_key in nk:
+                    short, long = (nk, backstage_key) if len(nk) < len(backstage_key) else (backstage_key, nk)
+                    name_score = len(short) / max(len(long), 1)
+            candidates.append((ratio, name_score, ev))
+    if not candidates:
+        return None
+    # Sort desc by (period, name)
+    candidates.sort(key=lambda c: (c[0], c[1]), reverse=True)
+    best = candidates[0]
+    # If top candidate's period overlap is ≥0.9 AND uniquely best, accept
+    # If lower overlap (0.6-0.9) and multiple similar candidates, require decent name match
+    if len(candidates) == 1:
+        return best[2]["pageId"]
+    # Multiple: require a clear winner (either much better period OR good name match)
+    second = candidates[1]
+    if best[0] - second[0] >= 0.2:
+        return best[2]["pageId"]
+    if best[1] >= 0.3 and best[1] > second[1]:
+        return best[2]["pageId"]
+    return None  # ambiguous → unlinked
 
 
-def load_event_index() -> Dict[str, str]:
-    """Return {normalized_name: event_page_id} map from イベント DB."""
-    idx: Dict[str, str] = {}
+def load_event_index() -> List[dict]:
+    """Return list of {page_id, name, key, start, end} dicts from イベント DB.
+    Dates are 'YYYY-MM-DD' strings (or None). Used for period-overlap matching.
+    """
+    def _date(prop_name: str, props: dict) -> Optional[str]:
+        d = (props.get(prop_name) or {}).get("date") or {}
+        return d.get("start")
+
+    events: List[dict] = []
     cursor = None
     pages = 0
     while True:
@@ -185,20 +229,23 @@ def load_event_index() -> Dict[str, str]:
             resp = _request("POST", f"/databases/{EVENTS_DB_ID}/query", body)
         except Exception as e:
             print(f"[notion] load_event_index err: {e}")
-            return idx
+            return events
         for p in resp.get("results", []):
             props = p.get("properties", {})
             title_prop = props.get(EVENT_TITLE_PROP, {})
             name = "".join(t.get("plain_text", "") for t in title_prop.get("title", []) or [])
-            key = normalize_event_name(name)
-            if key:
-                # If collision, keep first; user will see duplicates in DB
-                idx.setdefault(key, p["id"])
+            events.append({
+                "pageId": p["id"],
+                "name": name,
+                "key": normalize_event_name(name),
+                "start": _date("開始日", props),
+                "end": _date("終了日", props),
+            })
         pages += 1
         if not resp.get("has_more") or pages > 10:
             break
         cursor = resp.get("next_cursor")
-    return idx
+    return events
 
 
 def find_existing_row(event_id: str, host_id: str, date_iso: str) -> Optional[str]:
@@ -300,7 +347,9 @@ def sync_summaries(summaries: List[dict]) -> dict:
             now_ts,
         )
         event_key = normalize_event_name(s.get("eventName", ""))
-        event_page_id = match_event(event_key, event_idx)
+        bs_start = datetime.fromtimestamp(int(s["eventStart"]), JST).strftime("%Y-%m-%d") if s.get("eventStart") else None
+        bs_end = datetime.fromtimestamp(int(s["eventEnd"]), JST).strftime("%Y-%m-%d") if s.get("eventEnd") else None
+        event_page_id = match_event(event_key, bs_start, bs_end, event_idx)
         if event_page_id:
             stats["events_linked"] += 1
             print(f"\n[notion] event '{s.get('eventName', '')}' phase={phase}  → linked to イベントDB")
