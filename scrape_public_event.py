@@ -1,6 +1,9 @@
 """
 TikTok public event ranking scraper.
 
+⚠️ 2026-04-21 保留: web版は top 200 × 1部門しか取れない（TikTokアプリ誘導で制限）。
+Backstage一本化に方針変更。run.py 未統合。将来 Android UA偽装等で再開の可能性。
+
 For events hosted on tiktok.com/falcon/campaign/fusion_cosmic_runtime/ (TikTok official campaigns).
 API: POST /webcast/activity/dispatchv2/ returns user_rank__list_lead_players with top 200 by score.
 

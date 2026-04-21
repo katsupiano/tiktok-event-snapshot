@@ -37,7 +37,8 @@ EVENTS_DB_ID = os.environ.get("NOTION_EVENTS_DB_ID") or "e0ff7ce241954338be8334b
 
 # Property names on カルテ DB used to match creator
 KARTE_TITLE_PROP = "クリエイター名"
-KARTE_TIKTOK_ID_PROP = "クリエイターID"
+KARTE_TIKTOK_ID_PROP = "クリエイターID"  # username (display_id, e.g. "milu.ami")
+KARTE_HOST_ID_PROP = "hostId"  # numeric TikTok hostId (e.g. "7604791390933041168") — primary match key
 
 # Property names on イベント DB used to match by name
 EVENT_TITLE_PROP = "イベント名"
@@ -101,9 +102,15 @@ def _request(method: str, path: str, body: Optional[dict] = None, retries: int =
     raise last_err  # type: ignore
 
 
-def load_karte_index() -> Dict[str, str]:
-    """Return {tiktok_id_lower: karte_page_id} map from クリエイターカルテ DB."""
-    idx: Dict[str, str] = {}
+def load_karte_index() -> Dict[str, Dict[str, str]]:
+    """Return {'by_host': {hostId: karte_page_id}, 'by_username': {username_lower: karte_page_id}}.
+
+    hostId is the primary key — immutable per TikTok account. username (display_id)
+    is fallback only; Backstage can return stale usernames for ex-managed creators
+    (see 2026-04-19 incident: miruami wrong-linking).
+    """
+    by_host: Dict[str, str] = {}
+    by_username: Dict[str, str] = {}
     cursor = None
     page_count = 0
     while True:
@@ -113,20 +120,28 @@ def load_karte_index() -> Dict[str, str]:
         resp = _request("POST", f"/databases/{KARTE_DB_ID}/query", body)
         for p in resp.get("results", []):
             props = p.get("properties", {})
-            tiktok = ""
-            prop = props.get(KARTE_TIKTOK_ID_PROP, {})
-            for t in prop.get("rich_text", []) or []:
-                tiktok += t.get("plain_text", "")
-            tiktok = tiktok.strip().lower()
-            if tiktok:
-                idx[tiktok] = p["id"]
+
+            username = ""
+            for t in (props.get(KARTE_TIKTOK_ID_PROP, {}).get("rich_text") or []):
+                username += t.get("plain_text", "")
+            username = username.strip().lower()
+
+            host_id = ""
+            for t in (props.get(KARTE_HOST_ID_PROP, {}).get("rich_text") or []):
+                host_id += t.get("plain_text", "")
+            host_id = host_id.strip()
+
+            if host_id:
+                by_host[host_id] = p["id"]
+            if username:
+                by_username[username] = p["id"]
         page_count += 1
         if not resp.get("has_more"):
             break
         cursor = resp.get("next_cursor")
         if page_count > 20:
             break
-    return idx
+    return {"by_host": by_host, "by_username": by_username}
 
 
 def normalize_event_name(name: str) -> str:
@@ -335,11 +350,11 @@ def sync_summaries(summaries: List[dict]) -> dict:
     """Push each summary's katsuParticipants into イベント実績 DB.
     Returns stats dict.
     """
-    stats = {"created": 0, "updated": 0, "failed": 0, "skipped_no_karte": 0, "events_linked": 0, "events_unlinked": 0, "unlinked_names": []}
+    stats = {"created": 0, "updated": 0, "failed": 0, "skipped_no_karte": 0, "username_fallbacks": 0, "events_linked": 0, "events_unlinked": 0, "unlinked_names": []}
 
     print("[notion] loading karte index…")
     karte_idx = load_karte_index()
-    print(f"[notion] karte: {len(karte_idx)} creators indexed")
+    print(f"[notion] karte: {len(karte_idx['by_host'])} by hostId, {len(karte_idx['by_username'])} by username")
 
     print("[notion] loading event index…")
     event_idx = load_event_index()
@@ -369,8 +384,22 @@ def sync_summaries(summaries: List[dict]) -> dict:
         print(f"[notion] participants={len(participants)}")
         for e in participants:
             username = (e.get("username") or "").strip().lower()
-            host_id = e.get("hostId", "")
-            karte_id = karte_idx.get(username)
+            host_id = (e.get("hostId") or "").strip()
+            # Primary: hostId match. Fallback: username match (but only if the
+            # matched karte has NO hostId set — otherwise it belongs to a different
+            # TikTok account and we'd be mis-linking, like the 2026-04-19 miruami bug).
+            karte_id = karte_idx["by_host"].get(host_id) if host_id else None
+            if not karte_id:
+                by_username_id = karte_idx["by_username"].get(username)
+                if by_username_id and by_username_id not in karte_idx["by_host"].values():
+                    # username-only match AND that karte has no hostId yet → safe fallback
+                    karte_id = by_username_id
+                    stats["username_fallbacks"] += 1
+                    print(f"  ⚠ username-fallback link: @{username} (hostId {host_id}) → karte {by_username_id}")
+                elif by_username_id:
+                    # karte found by username but it already has a hostId pointing to someone else
+                    # → this scraped entry is NOT the karte's real creator. SKIP the relation.
+                    print(f"  ✗ username-match but hostId conflict: @{username} scraped hostId={host_id}, karte is another creator. Skipping relation.")
             if not karte_id:
                 stats["skipped_no_karte"] += 1
                 # Still proceed without relation (leave creator blank)
